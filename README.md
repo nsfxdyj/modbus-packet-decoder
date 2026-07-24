@@ -2,6 +2,7 @@
 
 A lightweight, **dependency-free** CLI tool to parse and analyze Modbus TCP/RTU packets from hex strings or binary files. Built for embedded & industrial IoT engineers who debug protocol traffic daily.
 
+![CI](https://github.com/nsfxdyj/modbus-packet-decoder/actions/workflows/ci.yml/badge.svg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ## Features
@@ -139,6 +140,24 @@ optional arguments:
   }
 ]
 ```
+
+## Development
+
+```bash
+# Install test dependencies
+pip install -r requirements-dev.txt
+
+# Run tests
+pytest -v
+
+# Run with coverage
+pytest -v --cov=modbus_packet_decoder --cov-report=term-missing
+
+# Run lint / type-check (optional)
+python -m py_compile modbus_packet_decoder.py
+```
+
+> **CI Note:** The included `github-ci.yml` can be moved to `.github/workflows/ci.yml` to enable GitHub Actions automated testing.
 
 ## Use Cases
 
