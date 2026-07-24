@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""
+Modbus Packet Decoder
+=====================
+A lightweight, dependency-free CLI tool to parse and analyze Modbus TCP/RTU
+packets from hex strings or binary files.
+
+Supports common function codes (01-06, 15, 16), colorized terminal output,
+and JSON export for further processing or CI pipelines.
+
+Author: nsfxdyj
+License: MIT
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from dataclasses import asdict, dataclass
+from typing import List, Optional
+
+__version__ = "1.0.0"
+
+# ---------------------------------------------------------------------------
+# Color helpers (no external deps)
+# ---------------------------------------------------------------------------
+
+class Colors:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    WHITE = "\033[37m"
+    DIM = "\033[2m"
+
+
+def color(text: str, c: str) -> str:
+    return f"{c}{text}{Colors.RESET}"
+
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MBAPHeader:
+    """Modbus TCP Application Protocol header (7 bytes)."""
+    transaction_id: int
+    protocol_id: int
+    length: int
+    unit_id: int
+
+    @staticmethod
+    def parse(data: bytes) -> MBAPHeader:
+        if len(data) < 7:
+            raise ValueError(f"MBAP header too short ({len(data)} bytes)")
+        return MBAPHeader(
+            transaction_id=int.from_bytes(data[0:2], "big"),
+            protocol_id=int.from_bytes(data[2:4], "big"),
+            length=int.from_bytes(data[4:6], "big"),
+            unit_id=data[6],
+        )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class PDU:
+    """Protocol Data Unit (function code + data)."""
+    function_code: int
+    is_exception: bool = False
+    data: bytes = b""
+    exception_code: Optional[int] = None
+    exception_name: Optional[str] = None
+
+    @staticmethod
+    def parse(data: bytes) -> PDU:
+        if len(data) < 1:
+            raise ValueError("PDU empty")
+        fc = data[0]
+        is_exc = (fc & 0x80) != 0
+        pdu = PDU(function_code=fc & 0x7F, is_exception=is_exc, data=data[1:])
+        if is_exc:
+            pdu.exception_code = data[1] if len(data) > 1 else None
+            pdu.exception_name = EXCEPTION_CODES.get(pdu.exception_code, "Unknown")
+        return pdu
+
+    def to_dict(self) -> dict:
+        d = {
+            "function_code": self.function_code,
+            "function_name": FUNCTION_NAMES.get(self.function_code, "Unknown"),
+            "is_exception": self.is_exception,
+            "data_hex": self.data.hex(),
+        }
+        if self.is_exception:
+            d["exception_code"] = self.exception_code
+            d["exception_name"] = self.exception_name
+        else:
+            d.update(self._decode_payload())
+        return d
+
+    def _decode_payload(self) -> dict:
+        """Attempt to decode the payload based on function code."""
+        fc = self.function_code
+        data = self.data
+        result: dict = {}
+
+        if fc in (1, 2, 3, 4):
+            # Distinguish request vs response for read function codes.
+            # Response: first byte is byte_count, remaining is data.
+            # Request: 2 bytes start address + 2 bytes quantity.
+            is_response = False
+            if len(data) >= 1:
+                byte_count = data[0]
+                expected_len = 1 + byte_count
+                if fc in (3, 4):
+                    # Holding / Input Registers: byte_count must be even, <= 250
+                    if byte_count % 2 == 0 and byte_count <= 250 and len(data) == expected_len:
+                        is_response = True
+                else:
+                    # Coils / Discrete Inputs: byte_count <= 250
+                    if byte_count <= 250 and len(data) == expected_len:
+                        is_response = True
+
+            if is_response:
+                result["byte_count"] = data[0]
+                if fc in (1, 2):
+                    bits = _bytes_to_bits(data[1:], result["byte_count"] * 8)
+                    result["coil_values"] = bits[:result["byte_count"] * 8]
+                else:  # fc 3, 4
+                    regs = []
+                    for i in range(1, len(data), 2):
+                        if i + 1 < len(data):
+                            regs.append(int.from_bytes(data[i:i+2], "big"))
+                    result["register_values"] = regs
+                    if regs:
+                        result["as_signed"] = [_to_signed(v) for v in regs]
+                        if len(regs) % 2 == 0:
+                            result["as_float32_be"] = [_to_float32(regs[i], regs[i+1]) for i in range(0, len(regs), 2)]
+            elif len(data) >= 4:
+                # Request interpretation
+                result["starting_address"] = int.from_bytes(data[0:2], "big")
+                result["quantity"] = int.from_bytes(data[2:4], "big")
+
+        elif fc == 5:
+            if len(data) >= 4:
+                result["address"] = int.from_bytes(data[0:2], "big")
+                val = int.from_bytes(data[2:4], "big")
+                result["value"] = val
+                result["value_desc"] = "ON" if val == 0xFF00 else "OFF" if val == 0x0000 else f"0x{val:04X}"
+
+        elif fc == 6:
+            if len(data) >= 4:
+                result["address"] = int.from_bytes(data[0:2], "big")
+                result["value"] = int.from_bytes(data[2:4], "big")
+
+        elif fc in (15, 16):
+            if len(data) >= 5:
+                result["starting_address"] = int.from_bytes(data[0:2], "big")
+                result["quantity"] = int.from_bytes(data[2:4], "big")
+                result["byte_count"] = data[4]
+
+        return result
+
+
+def _bytes_to_bits(data: bytes, n: int) -> List[int]:
+    bits = []
+    for b in data:
+        for i in range(8):
+            bits.append((b >> i) & 1)
+            if len(bits) >= n:
+                return bits
+    return bits
+
+
+def _to_signed(v: int) -> int:
+    return v - 65536 if v > 32767 else v
+
+
+def _to_float32(hi: int, lo: int) -> Optional[float]:
+    import struct
+    try:
+        packed = struct.pack(">HH", hi, lo)
+        return struct.unpack(">f", packed)[0]
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# CRC16 (Modbus RTU)
+# ---------------------------------------------------------------------------
+
+def crc16_modbus(data: bytes) -> int:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc
+
+
+# ---------------------------------------------------------------------------
+# Lookup tables
+# ---------------------------------------------------------------------------
+
+FUNCTION_NAMES = {
+    1: "Read Coils",
+    2: "Read Discrete Inputs",
+    3: "Read Holding Registers",
+    4: "Read Input Registers",
+    5: "Write Single Coil",
+    6: "Write Single Register",
+    15: "Write Multiple Coils",
+    16: "Write Multiple Registers",
+    17: "Report Slave ID",
+    20: "Read File Record",
+    21: "Write File Record",
+    22: "Mask Write Register",
+    23: "Read/Write Multiple Registers",
+    24: "Read FIFO Queue",
+    43: "Read Device Identification",
+}
+
+EXCEPTION_CODES = {
+    1: "Illegal Function",
+    2: "Illegal Data Address",
+    3: "Illegal Data Value",
+    4: "Slave Device Failure",
+    5: "Acknowledge",
+    6: "Slave Device Busy",
+    7: "Negative Acknowledge",
+    8: "Memory Parity Error",
+    10: "Gateway Path Unavailable",
+    11: "Gateway Target Device Failed",
+}
+
+
+# ---------------------------------------------------------------------------
+# Frame detection & parsing
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DecodedFrame:
+    frame_type: str          # "TCP" or "RTU"
+    raw_hex: str
+    mbap: Optional[MBAPHeader] = None
+    slave_id: Optional[int] = None
+    pdu: Optional[PDU] = None
+    crc: Optional[int] = None
+    crc_valid: Optional[bool] = None
+    error: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        d: dict = {"frame_type": self.frame_type, "raw_hex": self.raw_hex}
+        if self.mbap:
+            d["mbap"] = self.mbap.to_dict()
+        if self.slave_id is not None:
+            d["slave_id"] = self.slave_id
+        if self.pdu:
+            d["pdu"] = self.pdu.to_dict()
+        if self.crc is not None:
+            d["crc"] = f"0x{self.crc:04X}"
+            d["crc_valid"] = self.crc_valid
+        if self.error:
+            d["error"] = self.error
+        return d
+
+
+def hex_to_bytes(text: str) -> bytes:
+    """Convert various hex string formats to bytes."""
+    cleaned = re.sub(r"[^0-9A-Fa-f]", "", text)
+    if len(cleaned) % 2 != 0:
+        raise ValueError("Hex string has odd length")
+    return bytes.fromhex(cleaned)
+
+
+def detect_and_parse(data: bytes) -> DecodedFrame:
+    """Auto-detect Modbus TCP vs RTU and parse accordingly."""
+    if len(data) < 2:
+        return DecodedFrame(frame_type="UNKNOWN", raw_hex=data.hex(), error="Too short")
+
+    if len(data) >= 7:
+        proto_id = int.from_bytes(data[2:4], "big")
+        length = int.from_bytes(data[4:6], "big")
+        if proto_id == 0 and 1 <= length <= 260 and len(data) == 6 + length:
+            return _parse_tcp(data)
+
+    if len(data) >= 4:
+        payload = data[:-2]
+        received_crc = int.from_bytes(data[-2:], "little")
+        computed_crc = crc16_modbus(payload)
+        if received_crc == computed_crc:
+            return _parse_rtu(data, crc_valid=True)
+
+    if len(data) >= 8:
+        try:
+            return _parse_tcp(data)
+        except Exception:
+            pass
+
+    if len(data) >= 4:
+        try:
+            return _parse_rtu(data, crc_valid=False)
+        except Exception:
+            pass
+
+    return DecodedFrame(frame_type="UNKNOWN", raw_hex=data.hex(), error="Unable to detect frame type")
+
+
+def _parse_tcp(data: bytes) -> DecodedFrame:
+    if len(data) < 8:
+        raise ValueError("Modbus TCP frame too short")
+    mbap = MBAPHeader.parse(data)
+    pdu_data = data[7:7 + mbap.length - 1]
+    if len(pdu_data) < mbap.length - 1:
+        raise ValueError("MBAP length mismatch")
+    return DecodedFrame(
+        frame_type="TCP",
+        raw_hex=data.hex(),
+        mbap=mbap,
+        pdu=PDU.parse(pdu_data),
+    )
+
+
+def _parse_rtu(data: bytes, crc_valid: bool) -> DecodedFrame:
+    if len(data) < 4:
+        raise ValueError("Modbus RTU frame too short")
+    slave_id = data[0]
+    pdu_data = data[1:-2]
+    crc = int.from_bytes(data[-2:], "little")
+    return DecodedFrame(
+        frame_type="RTU",
+        raw_hex=data.hex(),
+        slave_id=slave_id,
+        pdu=PDU.parse(pdu_data),
+        crc=crc,
+        crc_valid=crc_valid,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pretty printer
+# ---------------------------------------------------------------------------
+
+def print_frame(frame: DecodedFrame, use_color: bool = True) -> None:
+    def c(text: str, col: str) -> str:
+        return color(text, col) if use_color else text
+
+    print()
+    print(c("═" * 60, Colors.CYAN))
+    ft_label = c(frame.frame_type, Colors.GREEN if frame.frame_type == "TCP" else Colors.YELLOW)
+    print(f"  Frame Type : {ft_label}")
+    print(f"  Raw Hex    : {c(frame.raw_hex, Colors.DIM)}")
+
+    if frame.error:
+        print(f"  {c('Error:', Colors.RED)} {frame.error}")
+        print(c("═" * 60, Colors.CYAN))
+        return
+
+    if frame.mbap:
+        mb = frame.mbap
+        print(f"  MBAP Header:")
+        print(f"    Transaction ID : {mb.transaction_id}")
+        print(f"    Protocol ID    : {mb.protocol_id} (Modbus)")
+        print(f"    Length         : {mb.length} bytes")
+        print(f"    Unit ID        : {mb.unit_id}")
+
+    if frame.slave_id is not None:
+        crc_status = c("VALID", Colors.GREEN) if frame.crc_valid else c("INVALID", Colors.RED)
+        print(f"  Slave ID   : {frame.slave_id}")
+        print(f"  CRC        : 0x{frame.crc:04X} ({crc_status})")
+
+    if frame.pdu:
+        pdu = frame.pdu
+        fc_name = FUNCTION_NAMES.get(pdu.function_code, "Unknown")
+        if pdu.is_exception:
+            exc_str = f"0x{pdu.exception_code:02X}" if pdu.exception_code is not None else "N/A"
+            print(f"  Function   : {c(f'0x{pdu.function_code:02X} ({fc_name})', Colors.YELLOW)} {c('[EXCEPTION]', Colors.RED)}")
+            print(f"  Exception  : {c(exc_str, Colors.RED)} – {pdu.exception_name or 'Unknown'}")
+        else:
+            print(f"  Function   : {c(f'0x{pdu.function_code:02X}', Colors.GREEN)} – {fc_name}")
+            payload = pdu._decode_payload()
+            for key, val in payload.items():
+                if key in ("coil_values", "register_values", "as_signed", "as_float32_be"):
+                    continue
+                print(f"    {key:18s}: {val}")
+            if "register_values" in payload:
+                vals = payload["register_values"]
+                print(f"    Register values : {vals}")
+                if "as_signed" in payload:
+                    print(f"    Signed          : {payload['as_signed']}")
+                if "as_float32_be" in payload:
+                    floats = [f"{v:.4f}" if v is not None else "NaN" for v in payload["as_float32_be"]]
+                    print(f"    Float32 (BE)    : {floats}")
+            if "coil_values" in payload:
+                coils = payload["coil_values"]
+                print(f"    Coil values     : {coils}")
+
+    print(c("═" * 60, Colors.CYAN))
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="modbus_packet_decoder",
+        description="Decode Modbus TCP/RTU packets from hex strings or binary files.",
+    )
+    p.add_argument("input", nargs="?", help="Hex string (e.g. '00010000000601030000000A') or '-' for stdin")
+    p.add_argument("--file", "-f", help="Read binary packet data from file")
+    p.add_argument("--json", "-j", help="Export decoded results to JSON file")
+    p.add_argument("--no-color", action="store_true", help="Disable colorized output")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    use_color = not args.no_color and sys.stdout.isatty()
+
+    frames: List[DecodedFrame] = []
+
+    if args.file:
+        with open(args.file, "rb") as f:
+            data = f.read()
+        frame = detect_and_parse(data)
+        frames.append(frame)
+        print_frame(frame, use_color)
+    elif args.input == "-" or (args.input is None and not sys.stdin.isatty()):
+        raw = sys.stdin.read()
+        try:
+            data = hex_to_bytes(raw)
+            frame = detect_and_parse(data)
+            frames.append(frame)
+            print_frame(frame, use_color)
+        except Exception as e:
+            print(f"Error parsing stdin: {e}", file=sys.stderr)
+            return 1
+    elif args.input:
+        try:
+            data = hex_to_bytes(args.input)
+            frame = detect_and_parse(data)
+            frames.append(frame)
+            print_frame(frame, use_color)
+        except Exception as e:
+            print(f"Error parsing input: {e}", file=sys.stderr)
+            return 1
+    else:
+        parser.print_help()
+        return 0
+
+    if args.json:
+        with open(args.json, "w", encoding="utf-8") as f:
+            json.dump([f.to_dict() for f in frames], f, indent=2)
+        print(f"\nJSON exported to {args.json}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
