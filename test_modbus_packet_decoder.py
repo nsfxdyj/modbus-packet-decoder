@@ -32,6 +32,7 @@ from modbus_packet_decoder import (
     print_frame,
     main,
     build_parser,
+    _export_csv,
 )
 
 
@@ -231,6 +232,55 @@ class TestFrameDetection:
         frame = _parse_rtu(data, crc_valid=True)
         assert frame.frame_type == "RTU"
         assert frame.pdu.function_code == 6
+
+
+# ---------------------------------------------------------------------------
+# Batch & CSV export
+# ---------------------------------------------------------------------------
+
+class TestBatchCSV:
+    def test_batch_file(self, tmp_path, capsys):
+        batch_file = tmp_path / "packets.txt"
+        batch_file.write_text(
+            "# comment\n"
+            "00 01 00 00 00 06 01 03 00 00 00 0A\n"
+            "\n"
+            "01 03 04 00 64 00 C8 BA 7A\n"
+        )
+        ret = main(["--batch", str(batch_file)])
+        assert ret == 0
+        captured = capsys.readouterr()
+        assert "TCP" in captured.out
+        assert "RTU" in captured.out
+
+    def test_batch_csv_export(self, tmp_path, capsys):
+        batch_file = tmp_path / "packets.txt"
+        batch_file.write_text("01 03 04 00 64 00 C8 BA 7A\n")
+        csv_file = tmp_path / "out.csv"
+        ret = main(["--batch", str(batch_file), "--csv", str(csv_file)])
+        assert ret == 0
+        assert csv_file.exists()
+        content = csv_file.read_text()
+        assert "frame_type" in content
+        assert "RTU" in content
+        captured = capsys.readouterr()
+        assert "CSV exported" in captured.out
+
+    def test_batch_file_not_found(self, capsys):
+        ret = main(["--batch", "nonexistent.txt"])
+        assert ret == 1
+        captured = capsys.readouterr()
+        assert "Error" in captured.err
+
+    def test_export_csv_direct(self, tmp_path):
+        data = bytes([0x01, 0x03, 0x04, 0x00, 0x64, 0x00, 0xC8, 0xBA, 0x7A])
+        frame = detect_and_parse(data)
+        csv_file = tmp_path / "direct.csv"
+        _export_csv([frame], str(csv_file))
+        content = csv_file.read_text()
+        assert "frame_type,raw_hex" in content
+        assert "RTU" in content
+        assert "0x7ABA" in content
 
 
 # ---------------------------------------------------------------------------

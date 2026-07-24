@@ -12,6 +12,8 @@ A lightweight, **dependency-free** CLI tool to parse and analyze Modbus TCP/RTU 
 - **Smart payload interpretation**: register values as unsigned, signed, and Float32-BE
 - **Colorized terminal output** (auto-disabled when piped)
 - **JSON export** for CI pipelines or further processing
+- **CSV export** for spreadsheet analysis and batch reporting
+- **Batch mode** – process multiple hex lines from a text file in one shot
 - **Zero dependencies** – pure Python 3.8+
 
 ## Install
@@ -86,6 +88,25 @@ python modbus_packet_decoder.py --file capture.bin --json output.json
 echo "00010000000601030000000A" | python modbus_packet_decoder.py -
 ```
 
+### 5. Batch-process a log file and export to CSV
+
+Create a text file `packets.txt`:
+```
+# Site A – morning samples
+00 01 00 00 00 06 01 03 00 00 00 0A
+01 03 04 00 64 00 C8 BA 7A
+
+# Site B – afternoon samples
+00 02 00 00 00 06 01 04 00 00 00 05
+```
+
+Run:
+```bash
+python modbus_packet_decoder.py --batch packets.txt --csv report.csv
+```
+
+Resulting `report.csv` contains one row per packet with frame type, MBAP/RTU metadata, function code, and a JSON payload column for easy pivoting in Excel or Pandas.
+
 ## Supported Function Codes
 
 | Code | Name | Decode Details |
@@ -103,7 +124,9 @@ echo "00010000000601030000000A" | python modbus_packet_decoder.py -
 ## CLI Reference
 
 ```
-usage: modbus_packet_decoder [-h] [--file FILE] [--json JSON] [--no-color] [--version] [input]
+usage: modbus_packet_decoder [-h] [--file FILE] [--batch BATCH] [--json JSON]
+                             [--csv CSV] [--no-color] [--version]
+                             [input]
 
 positional arguments:
   input         Hex string or '-' for stdin
@@ -111,7 +134,10 @@ positional arguments:
 optional arguments:
   -h, --help    show this help message and exit
   -f, --file    Read binary packet data from file
+  -b, --batch   Read multiple hex lines from text file (one per line,
+                # comments supported)
   -j, --json    Export decoded results to JSON file
+  -c, --csv     Export decoded results to CSV file
   --no-color    Disable colorized output
   --version     show program's version number and exit
 ```
@@ -141,6 +167,12 @@ optional arguments:
 ]
 ```
 
+## CSV Output Example
+
+| line | frame_type | raw_hex | slave_id | transaction_id | protocol_id | length | unit_id | function_code | function_name | is_exception | exception_code | exception_name | crc | crc_valid | error | payload_json |
+|------|------------|---------|----------|----------------|-------------|--------|---------|---------------|---------------|--------------|----------------|----------------|-----|-----------|-------|--------------|
+| 1 | RTU | 010304006400c8ba7a | 1 | | | | | 3 | Read Holding Registers | False | | | 0x7ABA | True | | {"byte_count": 4, "register_values": [100, 200], ...} |
+
 ## Development
 
 ```bash
@@ -157,13 +189,12 @@ pytest -v --cov=modbus_packet_decoder --cov-report=term-missing
 python -m py_compile modbus_packet_decoder.py
 ```
 
-> **CI Note:** The included `github-ci.yml` can be moved to `.github/workflows/ci.yml` to enable GitHub Actions automated testing.
-
 ## Use Cases
 
 - Debugging Modbus traffic from serial sniffers or TCP dumps
 - Validating PLC / HMI communication in the field
 - Writing unit tests for Modbus client libraries
+- Batch-analysing protocol logs from SCADA or gateway devices
 - Quick sanity checks without firing up Wireshark
 
 ## License
