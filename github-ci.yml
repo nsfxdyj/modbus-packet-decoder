@@ -35,3 +35,6 @@ jobs:
         run: |
           python modbus_packet_decoder.py --version
           python modbus_packet_decoder.py "00 01 00 00 00 06 01 03 00 00 00 0A"
+          echo -e "01 03 04 00 64 00 C8 BA 7A\n# comment\n\n00 01 00 00 00 06 01 03 00 00 00 0A" > /tmp/batch.txt
+          python modbus_packet_decoder.py --batch /tmp/batch.txt --csv /tmp/out.csv
+          cat /tmp/out.csv
