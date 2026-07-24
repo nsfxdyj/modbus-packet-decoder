@@ -6,7 +6,7 @@ A lightweight, dependency-free CLI tool to parse and analyze Modbus TCP/RTU
 packets from hex strings or binary files.
 
 Supports common function codes (01-06, 15, 16), colorized terminal output,
-and JSON export for further processing or CI pipelines.
+and JSON/CSV export for further processing or CI pipelines.
 
 Author: nsfxdyj
 License: MIT
@@ -15,13 +15,15 @@ License: MIT
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 import sys
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import List, Optional
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Color helpers (no external deps)
@@ -410,6 +412,49 @@ def print_frame(frame: DecodedFrame, use_color: bool = True) -> None:
 
 
 # ---------------------------------------------------------------------------
+# CSV export
+# ---------------------------------------------------------------------------
+
+def _export_csv(frames: List[DecodedFrame], path: str) -> None:
+    """Export a list of decoded frames to CSV."""
+    headers = [
+        "line", "frame_type", "raw_hex",
+        "slave_id", "transaction_id", "protocol_id", "length", "unit_id",
+        "function_code", "function_name", "is_exception",
+        "exception_code", "exception_name",
+        "crc", "crc_valid", "error", "payload_json",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        for i, frame in enumerate(frames, 1):
+            mbap = frame.mbap
+            pdu = frame.pdu
+            payload_json = ""
+            if pdu and not pdu.is_exception:
+                payload_json = json.dumps(pdu._decode_payload(), ensure_ascii=False)
+            writer.writerow([
+                i,
+                frame.frame_type,
+                frame.raw_hex,
+                frame.slave_id if frame.slave_id is not None else "",
+                mbap.transaction_id if mbap else "",
+                mbap.protocol_id if mbap else "",
+                mbap.length if mbap else "",
+                mbap.unit_id if mbap else "",
+                pdu.function_code if pdu else "",
+                FUNCTION_NAMES.get(pdu.function_code, "Unknown") if pdu else "",
+                pdu.is_exception if pdu else "",
+                pdu.exception_code if pdu and pdu.is_exception else "",
+                pdu.exception_name if pdu and pdu.is_exception else "",
+                f"0x{frame.crc:04X}" if frame.crc is not None else "",
+                frame.crc_valid if frame.crc_valid is not None else "",
+                frame.error or "",
+                payload_json,
+            ])
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -420,7 +465,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("input", nargs="?", help="Hex string (e.g. '00010000000601030000000A') or '-' for stdin")
     p.add_argument("--file", "-f", help="Read binary packet data from file")
+    p.add_argument("--batch", "-b", help="Read multiple hex lines from text file (one per line, # comments supported)")
     p.add_argument("--json", "-j", help="Export decoded results to JSON file")
+    p.add_argument("--csv", "-c", help="Export decoded results to CSV file")
     p.add_argument("--no-color", action="store_true", help="Disable colorized output")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
@@ -433,7 +480,23 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     frames: List[DecodedFrame] = []
 
-    if args.file:
+    if args.batch:
+        if not Path(args.batch).exists():
+            print(f"Error: batch file not found: {args.batch}", file=sys.stderr)
+            return 1
+        with open(args.batch, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    data = hex_to_bytes(line)
+                    frame = detect_and_parse(data)
+                    frames.append(frame)
+                    print_frame(frame, use_color)
+                except Exception as e:
+                    print(f"Error parsing line {line_num}: {e}", file=sys.stderr)
+    elif args.file:
         with open(args.file, "rb") as f:
             data = f.read()
         frame = detect_and_parse(data)
@@ -466,6 +529,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump([f.to_dict() for f in frames], f, indent=2)
         print(f"\nJSON exported to {args.json}")
+
+    if args.csv:
+        _export_csv(frames, args.csv)
+        print(f"\nCSV exported to {args.csv}")
 
     return 0
 
