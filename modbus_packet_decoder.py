@@ -6,7 +6,8 @@ A lightweight, dependency-free CLI tool to parse and analyze Modbus TCP/RTU
 packets from hex strings or binary files.
 
 Supports common function codes (01-06, 15, 16), colorized terminal output,
-and JSON/CSV export for further processing or CI pipelines.
+JSON/CSV export for further processing or CI pipelines, and a transparent
+TCP proxy mode for real-time field debugging.
 
 Author: nsfxdyj
 License: MIT
@@ -18,12 +19,14 @@ import argparse
 import csv
 import json
 import re
+import socket
 import sys
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # ---------------------------------------------------------------------------
 # Color helpers (no external deps)
@@ -209,6 +212,38 @@ def crc16_modbus(data: bytes) -> int:
             else:
                 crc >>= 1
     return crc
+
+
+# ---------------------------------------------------------------------------
+# TCP Stream frame extraction (handles TCP stickiness / splitting)
+# ---------------------------------------------------------------------------
+
+def extract_tcp_frames(buffer: bytearray) -> List[bytes]:
+    """Extract complete Modbus TCP frames from a bytearray buffer.
+
+    Modbus TCP frames are prefixed by a 7-byte MBAP header.  Bytes 5-6
+    (big-endian) give the *remaining* length (unit_id + PDU).  The total
+    frame size is therefore 6 + length.  This function removes complete
+    frames from *buffer* (in place) and returns them as a list.
+
+    Example – two back-to-back frames in one recv():
+        >>> buf = bytearray(b'\\x00\\x01\\x00\\x00\\x00\\x06\\x01\\x03\\x00\\x00\\x00\\x0A'
+        ...                 b'\\x00\\x02\\x00\\x00\\x00\\x06\\x01\\x04\\x00\\x00\\x00\\x05')
+        >>> extract_tcp_frames(buf)
+        [b'...12 bytes...', b'...12 bytes...']
+        >>> len(buf)
+        0
+    """
+    frames: List[bytes] = []
+    while len(buffer) >= 7:
+        length = int.from_bytes(buffer[4:6], "big")
+        frame_len = 6 + length
+        if len(buffer) >= frame_len:
+            frames.append(bytes(buffer[:frame_len]))
+            del buffer[:frame_len]
+        else:
+            break
+    return frames
 
 
 # ---------------------------------------------------------------------------
@@ -455,13 +490,140 @@ def _export_csv(frames: List[DecodedFrame], path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Modbus TCP Transparent Proxy (real-time decoding)
+# ---------------------------------------------------------------------------
+
+class ProxyPipe(threading.Thread):
+    """Forward data from *src* to *dst*, extracting and printing Modbus TCP frames."""
+
+    def __init__(
+        self,
+        src: socket.socket,
+        dst: socket.socket,
+        label: str,
+        use_color: bool = True,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.src = src
+        self.dst = dst
+        self.label = label          # e.g. "C→S" or "S→C"
+        self.use_color = use_color
+        self._buffer = bytearray()
+        self._running = True
+
+    def run(self) -> None:
+        c = lambda text, col: color(text, col) if self.use_color else text
+        while self._running:
+            try:
+                chunk = self.src.recv(4096)
+                if not chunk:
+                    break
+                self._buffer.extend(chunk)
+                frames = extract_tcp_frames(self._buffer)
+                for frame in frames:
+                    decoded = detect_and_parse(frame)
+                    print_frame(decoded, self.use_color)
+                    tag = c(f"[{self.label}]", Colors.MAGENTA)
+                    print(
+                        f"{tag} {decoded.frame_type} frame "
+                        f"forwarded ({len(frame)} bytes)\n"
+                    )
+                self.dst.sendall(chunk)
+            except OSError:
+                break
+            except Exception as e:
+                print(
+                    f"[{self.label}] Error: {e}",
+                    file=sys.stderr,
+                )
+                break
+        self._running = False
+
+    def stop(self) -> None:
+        self._running = False
+        try:
+            self.src.shutdown(socket.SHUT_RD)
+        except OSError:
+            pass
+
+
+def run_proxy(
+    listen_port: int,
+    target_host: str,
+    target_port: int,
+    use_color: bool = True,
+) -> None:
+    """Run a transparent Modbus TCP proxy with real-time decoding.
+
+    The proxy listens on *listen_port* and forwards every byte to
+    *target_host*:*target_port*.  All Modbus TCP frames that pass
+    through are decoded and printed in real time, making this ideal
+    for field debugging between an HMI/SCADA and a PLC.
+    """
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", listen_port))
+    server.listen(5)
+
+    c = lambda text, col: color(text, col) if use_color else text
+    print(c(f"Modbus TCP Proxy listening on 0.0.0.0:{listen_port}", Colors.GREEN))
+    print(c(f"Forwarding to {target_host}:{target_port}", Colors.GREEN))
+    print(c("Press Ctrl+C to stop", Colors.DIM))
+    print()
+
+    try:
+        while True:
+            client_sock, addr = server.accept()
+            print(c(f"Client connected: {addr[0]}:{addr[1]}", Colors.CYAN))
+
+            try:
+                target_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                target_sock.connect((target_host, target_port))
+            except Exception as e:
+                print(
+                    c(f"Failed to connect to target: {e}", Colors.RED),
+                    file=sys.stderr,
+                )
+                client_sock.close()
+                continue
+
+            pipe_cs = ProxyPipe(client_sock, target_sock, "C→S", use_color)
+            pipe_sc = ProxyPipe(target_sock, client_sock, "S→C", use_color)
+            pipe_cs.start()
+            pipe_sc.start()
+
+            # Wait until at least one pipe dies (connection closed by either side)
+            while pipe_cs.is_alive() and pipe_sc.is_alive():
+                pipe_cs.join(timeout=0.5)
+
+            pipe_cs.stop()
+            pipe_sc.stop()
+            try:
+                client_sock.close()
+            except OSError:
+                pass
+            try:
+                target_sock.close()
+            except OSError:
+                pass
+            print(c(f"Client disconnected: {addr[0]}:{addr[1]}", Colors.YELLOW))
+            print()
+    except KeyboardInterrupt:
+        print()
+        print(c("Shutting down proxy...", Colors.YELLOW))
+    finally:
+        server.close()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="modbus_packet_decoder",
-        description="Decode Modbus TCP/RTU packets from hex strings or binary files.",
+        description="Decode Modbus TCP/RTU packets from hex strings or binary files. "
+                    "Optionally run as a transparent TCP proxy for real-time debugging.",
     )
     p.add_argument("input", nargs="?", help="Hex string (e.g. '00010000000601030000000A') or '-' for stdin")
     p.add_argument("--file", "-f", help="Read binary packet data from file")
@@ -470,6 +632,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--csv", "-c", help="Export decoded results to CSV file")
     p.add_argument("--no-color", action="store_true", help="Disable colorized output")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+
+    # Proxy mode
+    proxy = p.add_argument_group("Proxy mode")
+    proxy.add_argument("--proxy", action="store_true",
+                       help="Run as a transparent Modbus TCP proxy with real-time decoding")
+    proxy.add_argument("--target-host", default="127.0.0.1",
+                       help="Target Modbus server host (default: 127.0.0.1)")
+    proxy.add_argument("--target-port", type=int, default=502,
+                       help="Target Modbus server port (default: 502)")
+    proxy.add_argument("--listen-port", type=int, default=1502,
+                       help="Local listen port for proxy mode (default: 1502)")
     return p
 
 
@@ -477,6 +650,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     use_color = not args.no_color and sys.stdout.isatty()
+
+    # Proxy mode takes precedence over all other modes
+    if args.proxy:
+        run_proxy(args.listen_port, args.target_host, args.target_port, use_color)
+        return 0
 
     frames: List[DecodedFrame] = []
 

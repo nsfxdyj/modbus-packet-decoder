@@ -14,6 +14,7 @@ A lightweight, **dependency-free** CLI tool to parse and analyze Modbus TCP/RTU 
 - **JSON export** for CI pipelines or further processing
 - **CSV export** for spreadsheet analysis and batch reporting
 - **Batch mode** – process multiple hex lines from a text file in one shot
+- **Transparent TCP proxy** – sit between an HMI/SCADA and a PLC to see live traffic
 - **Zero dependencies** – pure Python 3.8+
 
 ## Install
@@ -107,6 +108,59 @@ python modbus_packet_decoder.py --batch packets.txt --csv report.csv
 
 Resulting `report.csv` contains one row per packet with frame type, MBAP/RTU metadata, function code, and a JSON payload column for easy pivoting in Excel or Pandas.
 
+### 6. Run as a transparent TCP proxy (live debugging)
+
+Place the tool between your Modbus client (HMI/SCADA) and the PLC:
+
+```bash
+# The real PLC is at 192.168.1.100:502
+# Proxy listens on port 1502 and forwards everything to the PLC
+python modbus_packet_decoder.py --proxy --target-host 192.168.1.100 --target-port 502 --listen-port 1502
+```
+
+Now point your HMI to `your-laptop-ip:1502` instead of the PLC directly. Every request and response is decoded and printed in real time:
+
+```
+Modbus TCP Proxy listening on 0.0.0.0:1502
+Forwarding to 192.168.1.100:502
+Press Ctrl+C to stop
+
+Client connected: 192.168.1.50:49152
+
+════════════════════════════════════════════════════════════
+  Frame Type : TCP
+  Raw Hex    : 00010000000601030000000a
+  MBAP Header:
+    Transaction ID : 1
+    Protocol ID    : 0 (Modbus)
+    Length         : 6 bytes
+    Unit ID        : 1
+  Function   : 0x03 – Read Holding Registers
+    starting_address: 0
+    quantity        : 10
+════════════════════════════════════════════════════════════
+[C→S] TCP frame forwarded (12 bytes)
+
+════════════════════════════════════════════════════════════
+  Frame Type : TCP
+  Raw Hex    : 000100000017010314006400c8007b00000000000000000000
+  MBAP Header:
+    Transaction ID : 1
+    Protocol ID    : 0 (Modbus)
+    Length         : 23 bytes
+    Unit ID        : 1
+  Function   : 0x03 – Read Holding Registers
+    byte_count      : 20
+    Register values : [100, 200, 123, 0, 0, 0, 0, 0, 0, 0]
+    Signed          : [100, 200, 123, 0, 0, 0, 0, 0, 0, 0]
+════════════════════════════════════════════════════════════
+[S→C] TCP frame forwarded (29 bytes)
+
+Client disconnected: 192.168.1.50:49152
+```
+
+The proxy handles **TCP stickiness and splitting** automatically, so even if the OS delivers multiple Modbus frames in a single `recv()` or splits one frame across two, each frame is extracted and decoded individually.
+
 ## Supported Function Codes
 
 | Code | Name | Decode Details |
@@ -126,20 +180,33 @@ Resulting `report.csv` contains one row per packet with frame type, MBAP/RTU met
 ```
 usage: modbus_packet_decoder [-h] [--file FILE] [--batch BATCH] [--json JSON]
                              [--csv CSV] [--no-color] [--version]
+                             [--proxy] [--target-host TARGET_HOST]
+                             [--target-port TARGET_PORT]
+                             [--listen-port LISTEN_PORT]
                              [input]
 
 positional arguments:
-  input         Hex string or '-' for stdin
+  input                 Hex string or '-' for stdin
 
 optional arguments:
-  -h, --help    show this help message and exit
-  -f, --file    Read binary packet data from file
-  -b, --batch   Read multiple hex lines from text file (one per line,
-                # comments supported)
-  -j, --json    Export decoded results to JSON file
-  -c, --csv     Export decoded results to CSV file
-  --no-color    Disable colorized output
-  --version     show program's version number and exit
+  -h, --help            show this help message and exit
+  -f, --file FILE       Read binary packet data from file
+  -b, --batch BATCH     Read multiple hex lines from text file (one per line,
+                        # comments supported)
+  -j, --json JSON       Export decoded results to JSON file
+  -c, --csv CSV         Export decoded results to CSV file
+  --no-color            Disable colorized output
+  --version             show program's version number and exit
+
+Proxy mode:
+  --proxy               Run as a transparent Modbus TCP proxy with real-time
+                        decoding
+  --target-host TARGET_HOST
+                        Target Modbus server host (default: 127.0.0.1)
+  --target-port TARGET_PORT
+                        Target Modbus server port (default: 502)
+  --listen-port LISTEN_PORT
+                        Local listen port for proxy mode (default: 1502)
 ```
 
 ## JSON Output Example
@@ -196,6 +263,7 @@ python -m py_compile modbus_packet_decoder.py
 - Writing unit tests for Modbus client libraries
 - Batch-analysing protocol logs from SCADA or gateway devices
 - Quick sanity checks without firing up Wireshark
+- **Live field debugging** by placing the proxy between HMI and PLC
 
 ## License
 

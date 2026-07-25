@@ -27,6 +27,7 @@ from modbus_packet_decoder import (
     _to_signed,
     _to_float32,
     _bytes_to_bits,
+    extract_tcp_frames,
     FUNCTION_NAMES,
     EXCEPTION_CODES,
     print_frame,
@@ -85,6 +86,100 @@ class TestColorsAndHelpers:
         data = bytes([0x01, 0x03, 0x00, 0x00, 0x00, 0x0A])
         crc = crc16_modbus(data)
         assert crc == 0xC40A
+
+
+# ---------------------------------------------------------------------------
+# TCP Stream frame extraction
+# ---------------------------------------------------------------------------
+
+class TestExtractTcpFrames:
+    def test_single_frame(self):
+        buf = bytearray(bytes([
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01,
+            0x03, 0x00, 0x00, 0x00, 0x0A,
+        ]))
+        frames = extract_tcp_frames(buf)
+        assert len(frames) == 1
+        assert len(frames[0]) == 12
+        assert len(buf) == 0
+
+    def test_two_frames_sticky(self):
+        """Two back-to-back frames delivered in one recv() (TCP stickiness)."""
+        frame1 = bytes([
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01,
+            0x03, 0x00, 0x00, 0x00, 0x0A,
+        ])
+        frame2 = bytes([
+            0x00, 0x02, 0x00, 0x00, 0x00, 0x06, 0x01,
+            0x04, 0x00, 0x00, 0x00, 0x05,
+        ])
+        buf = bytearray(frame1 + frame2)
+        frames = extract_tcp_frames(buf)
+        assert len(frames) == 2
+        assert frames[0] == frame1
+        assert frames[1] == frame2
+        assert len(buf) == 0
+
+    def test_partial_frame(self):
+        """Only 5 bytes received – not enough for MBAP header."""
+        buf = bytearray(b"\x00\x01\x00\x00\x00")
+        frames = extract_tcp_frames(buf)
+        assert len(frames) == 0
+        assert len(buf) == 5
+
+    def test_header_only(self):
+        """Exactly 7 bytes (full MBAP) but no PDU data yet."""
+        buf = bytearray(bytes([
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01,
+        ]))
+        frames = extract_tcp_frames(buf)
+        assert len(frames) == 0
+        assert len(buf) == 7
+
+    def test_split_across_calls(self):
+        """Frame arrives in two chunks (TCP splitting)."""
+        buf = bytearray(bytes([
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01,
+        ]))
+        frames = extract_tcp_frames(buf)
+        assert len(frames) == 0
+
+        # Second chunk – the PDU
+        buf.extend(bytes([0x03, 0x00, 0x00, 0x00, 0x0A]))
+        frames = extract_tcp_frames(buf)
+        assert len(frames) == 1
+        assert len(frames[0]) == 12
+        assert len(buf) == 0
+
+    def test_extra_bytes_after_frame(self):
+        """One complete frame plus a partial second frame."""
+        frame1 = bytes([
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01,
+            0x03, 0x00, 0x00, 0x00, 0x0A,
+        ])
+        partial = bytes([0x00, 0x02, 0x00, 0x00])  # incomplete MBAP
+        buf = bytearray(frame1 + partial)
+        frames = extract_tcp_frames(buf)
+        assert len(frames) == 1
+        assert frames[0] == frame1
+        assert buf == bytearray(partial)
+
+    def test_empty_buffer(self):
+        buf = bytearray()
+        frames = extract_tcp_frames(buf)
+        assert frames == []
+
+    def test_large_length(self):
+        """Frame with length=260 (max allowed by Modbus spec)."""
+        length = 260
+        pdu = bytes([0x03, length]) + bytes(length - 1)
+        header = bytes([0x00, 0x01, 0x00, 0x00]) + length.to_bytes(2, "big") + bytes([0x01])
+        frame = header + pdu
+        buf = bytearray(frame)
+        frames = extract_tcp_frames(buf)
+        assert len(frames) == 1
+        assert len(frames[0]) == 6 + length
+        assert len(buf) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +450,28 @@ class TestCLI:
         assert ret == 0
         captured = capsys.readouterr()
         assert "RTU" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Proxy CLI (smoke tests – ensure --proxy flag is recognized)
+# ---------------------------------------------------------------------------
+
+class TestProxyCLI:
+    def test_parser_proxy_flags(self):
+        parser = build_parser()
+        args = parser.parse_args(["--proxy", "--target-host", "192.168.1.100", "--target-port", "502", "--listen-port", "1502"])
+        assert args.proxy is True
+        assert args.target_host == "192.168.1.100"
+        assert args.target_port == 502
+        assert args.listen_port == 1502
+
+    def test_parser_proxy_defaults(self):
+        parser = build_parser()
+        args = parser.parse_args(["--proxy"])
+        assert args.proxy is True
+        assert args.target_host == "127.0.0.1"
+        assert args.target_port == 502
+        assert args.listen_port == 1502
 
 
 # ---------------------------------------------------------------------------
