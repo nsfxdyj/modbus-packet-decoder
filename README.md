@@ -5,6 +5,17 @@ A lightweight, **dependency-free** CLI tool to parse and analyze Modbus TCP/RTU 
 ![CI](https://github.com/nsfxdyj/modbus-packet-decoder/actions/workflows/ci.yml/badge.svg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+## What this is for
+
+You are on site, a Modbus device "stopped working", and all you have is a
+hex dump from a serial sniffer or a TCP capture. Wireshark is a download
+and an admin password away, and the plant laptop is not yours. This tool
+is a single Python file with zero dependencies: paste the hex, get the
+decoded frame.
+Point it at a capture file for batch analysis and CSV export, or run it
+as a transparent proxy between the HMI and the PLC and watch live traffic
+decoded in real time — TCP stickiness and frame splitting handled.
+
 ## Features
 
 - **Auto-detect** Modbus TCP (MBAP header) vs Modbus RTU (CRC16) frames
@@ -264,6 +275,12 @@ python -m py_compile modbus_packet_decoder.py
 - Batch-analysing protocol logs from SCADA or gateway devices
 - Quick sanity checks without firing up Wireshark
 - **Live field debugging** by placing the proxy between HMI and PLC
+
+## Custom work
+
+Need extra function codes, a different output format, or this baked into
+your test rig or CI pipeline? I build custom protocol tooling and do
+field-style communication debugging on commission: nsfxdyj@gmail.com
 
 ## License
 
