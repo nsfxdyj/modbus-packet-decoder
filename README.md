@@ -2,7 +2,7 @@
 
 A lightweight, **dependency-free** CLI tool to parse and analyze Modbus TCP/RTU packets from hex strings or binary files. Built for embedded & industrial IoT engineers who debug protocol traffic daily.
 
-![CI](https://github.com/nsfxdyj/modbus-packet-decoder/actions/workflows/ci.yml/badge.svg)
+[![CI](https://github.com/nsfxdyj/modbus-packet-decoder/actions/workflows/ci.yml/badge.svg)](https://github.com/nsfxdyj/modbus-packet-decoder/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ## What this is for
