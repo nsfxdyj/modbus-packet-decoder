@@ -82,10 +82,12 @@ class TestColorsAndHelpers:
         assert _to_float32(0x0000, 0x0000) == 0.0
 
     def test_crc16_modbus_known(self):
-        # CRC for slave_id=1, fc=3, 0x00, 0x00, 0x00, 0x0A should be 0xC40A
+        # Standard request 01 03 00 00 00 0A has wire CRC bytes C5 CD.
         data = bytes([0x01, 0x03, 0x00, 0x00, 0x00, 0x0A])
         crc = crc16_modbus(data)
-        assert crc == 0xC40A
+        assert crc == 0xCDC5
+        assert crc.to_bytes(2, "little") == b"\xC5\xCD"
+        assert crc16_modbus(b"123456789") == 0x4B37
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +174,8 @@ class TestExtractTcpFrames:
     def test_large_length(self):
         """Frame with length=260 (max allowed by Modbus spec)."""
         length = 260
-        pdu = bytes([0x03, length]) + bytes(length - 1)
+        # MBAP length includes the unit ID, leaving length - 1 PDU bytes.
+        pdu = bytes([0x03]) + bytes(length - 2)
         header = bytes([0x00, 0x01, 0x00, 0x00]) + length.to_bytes(2, "big") + bytes([0x01])
         frame = header + pdu
         buf = bytearray(frame)
@@ -236,7 +239,9 @@ class TestPDU:
         assert d["byte_count"] == 4
         assert d["register_values"] == [100, 200]
         assert d["as_signed"] == [100, 200]
-        assert d["as_float32_be"] == [100.0]
+        # Bytes 00 64 00 C8 are the Float32 bit pattern, not integer 100.0.
+        assert d["as_float32_be"] == [9.183829875491986e-39]
+        assert PDU.parse(bytes([0x03, 0x04, 0x42, 0xC8, 0x00, 0x00])).to_dict()["as_float32_be"] == [100.0]
 
     def test_decode_payload_fc03_request(self):
         pdu = PDU.parse(bytes([0x03, 0x00, 0x00, 0x00, 0x0A]))
@@ -407,7 +412,12 @@ class TestCLI:
         assert "RTU" in captured.out
         assert "VALID" in captured.out
 
-    def test_main_no_args(self, capsys):
+    def test_main_no_args(self, capsys, monkeypatch):
+        # No arguments on an interactive terminal shows help; piped stdin is
+        # covered separately by test_main_stdin.
+        monkeypatch.setattr(sys, "stdin", type("FakeStdin", (), {
+            "isatty": lambda self: True,
+        })())
         ret = main([])
         assert ret == 0
         captured = capsys.readouterr()

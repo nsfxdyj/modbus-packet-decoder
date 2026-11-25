@@ -314,8 +314,13 @@ class DecodedFrame:
 
 
 def hex_to_bytes(text: str) -> bytes:
-    """Convert various hex string formats to bytes."""
-    cleaned = re.sub(r"[^0-9A-Fa-f]", "", text)
+    """Convert whitespace-separated hex bytes, with optional 0x prefixes."""
+    cleaned = re.sub(r"0[xX]", "", text)
+    if re.search(r"[^0-9A-Fa-f\s]", cleaned):
+        raise ValueError("Hex string contains non-hexadecimal characters")
+    cleaned = re.sub(r"\s+", "", cleaned)
+    if not cleaned:
+        raise ValueError("Hex string is empty")
     if len(cleaned) % 2 != 0:
         raise ValueError("Hex string has odd length")
     return bytes.fromhex(cleaned)
