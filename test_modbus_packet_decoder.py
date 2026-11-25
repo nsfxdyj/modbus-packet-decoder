@@ -405,6 +405,16 @@ class TestCLI:
         assert "TCP" in captured.out
         assert "Read Holding Registers" in captured.out
 
+    def test_main_ansi_stdout_does_not_fail(self, monkeypatch):
+        import io
+
+        output = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+        monkeypatch.setattr(sys, "stdout", output)
+        ret = main(["00 01 00 00 00 06 01 03 00 00 00 0A"])
+        output.flush()
+        assert ret == 0
+        assert b"Frame Type" in output.buffer.getvalue()
+
     def test_main_rtu_hex(self, capsys):
         ret = main(["01 03 04 00 64 00 C8 BA 7A"])
         assert ret == 0

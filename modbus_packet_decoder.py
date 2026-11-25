@@ -652,6 +652,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    # Windows redirected output may use a legacy code page. Replace characters
+    # it cannot represent instead of failing an otherwise valid decode.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except (OSError, ValueError):
+                pass
+
     parser = build_parser()
     args = parser.parse_args(argv)
     use_color = not args.no_color and sys.stdout.isatty()
